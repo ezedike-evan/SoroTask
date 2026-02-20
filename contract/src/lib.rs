@@ -91,6 +91,10 @@ impl SoroTaskContract {
             .get(&task_key)
             .expect("Task not found");
 
+        if env.ledger().timestamp() < config.last_run + config.interval {
+            return;
+        }
+
         let should_execute = match config.resolver {
             Some(ref resolver_address) => {
                 // Call standardized method check_condition(args) -> bool
@@ -121,8 +125,16 @@ impl SoroTaskContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events};
-    use soroban_sdk::{vec, Env, FromVal, IntoVal};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
+    use soroban_sdk::{contract, contractimpl, vec, Env, FromVal, IntoVal};
+
+    #[contract]
+    pub struct DummyContract;
+
+    #[contractimpl]
+    impl DummyContract {
+        pub fn hello(_env: Env) {}
+    }
 
     #[test]
     fn test_register_and_get() {
@@ -227,4 +239,46 @@ mod test {
         let result = client.try_register(&config);
         assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(1))));
     }
+
+    #[test]
+    fn test_execute_honors_interval() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register_contract(None, SoroTaskContract);
+        let client = SoroTaskContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        let dummy_id = env.register_contract(None, DummyContract);
+        let target = dummy_id.clone();
+
+        let config = TaskConfig {
+            creator: creator.clone(),
+            target: target.clone(),
+            function: Symbol::new(&env, "hello"),
+            args: Vec::new(&env),
+            resolver: None,
+            interval: 100,
+            last_run: 0,
+            gas_balance: 1000,
+        };
+
+        let task_id = client.register(&config);
+
+        // First execution (ledger 50, last_run 0, interval 100)
+        // 50 < 0 + 100 -> returns early
+        env.ledger().set_timestamp(50);
+        client.execute(&task_id);
+        assert_eq!(client.get_task(&task_id).unwrap().last_run, 0);
+
+        env.ledger().set_timestamp(150);
+        client.execute(&task_id);
+        assert_eq!(client.get_task(&task_id).unwrap().last_run, 150);
+
+        // Next execution too soon
+        env.ledger().set_timestamp(200);
+        client.execute(&task_id);
+        assert_eq!(client.get_task(&task_id).unwrap().last_run, 150);
+    }
 }
+
